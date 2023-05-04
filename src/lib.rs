@@ -1,13 +1,15 @@
 use std::fs::File;
-use std::io::{BufReader, Error, ErrorKind, Read};
+use std::io::{BufReader, Error, ErrorKind, Read, Seek, SeekFrom};
 use std::mem;
 use std::mem::zeroed;
 use std::slice::from_raw_parts_mut;
 use inflate::inflate_bytes;
+use std::fmt::{Display, Formatter};
 
 pub trait FileProcessor {
     fn set_file(&mut self, file_name: &String, file_size: usize) -> Result<bool, Error>;
     fn process_file(&mut self, file_data: Vec<u8>) -> Result<(), Error>;
+    fn add_file(&mut self, file: ZipFile) -> Result<(), Error>;
 }
 
 #[repr(C, packed)]
@@ -69,7 +71,8 @@ impl ZipFileHeader {
 
 pub struct ZipFile {
     header: ZipFileHeader,
-    name: String
+    name: String,
+    data_offset: u64
 }
 
 impl ZipFile {
@@ -80,18 +83,26 @@ impl ZipFile {
     pub fn get_size(&self) -> usize { return self.header.uncompressed_size as usize }
 }
 
+impl Display for ZipFile {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let size = self.header.uncompressed_size;
+        write!(f, "Zip file: name {}, size: {}, data offset: {}", self.name, size, self.data_offset)
+    }
+}
+
 pub struct ZipArchive {
-    reader: BufReader<File>
+    reader: BufReader<File>,
+    current_offset: u64
 }
 
 pub fn open_zip_archive(file_name: &String) -> Result<ZipArchive, Error> {
     let file = File::open(file_name)?;
-    Ok(ZipArchive{ reader: BufReader::new(file) })
+    Ok(ZipArchive{ reader: BufReader::new(file), current_offset: 0 })
 }
 
 impl ZipArchive {
     pub fn next_zip_file(&mut self) -> Result<Option<ZipFile>, Error> {
-        let mut zip_file = ZipFile { header: unsafe { zeroed() }, name: "".to_string() };
+        let mut zip_file = ZipFile { header: unsafe { zeroed() }, name: "".to_string(), data_offset: 0 };
         unsafe {
             let header_slice = from_raw_parts_mut(&mut zip_file.header as *mut _ as *mut u8, ZIP_FILE_HEADER_SIZE);
             self.reader.read_exact(header_slice)?;
@@ -105,7 +116,13 @@ impl ZipArchive {
                 Ok(n) => n,
                 Err(_e) => return Err(Error::new(ErrorKind::InvalidInput, "could not convert file name to string"))
             };
-            self.reader.seek_relative(zip_file.header.extra_field_length as i64)?;
+            if zip_file.header.extra_field_length > 0 {
+                self.reader.seek_relative(zip_file.header.extra_field_length as i64)?;
+            }
+            self.current_offset += ZIP_FILE_HEADER_SIZE as u64;
+            self.current_offset += zip_file.header.file_name_length as u64;
+            self.current_offset += zip_file.header.extra_field_length as u64;
+            zip_file.data_offset = self.current_offset
         }
         Ok(Some(zip_file))
     }
@@ -113,8 +130,14 @@ impl ZipArchive {
     pub fn skip_data(&mut self, file: &ZipFile) -> Result<(), Error> {
         if file.header.compressed_size > 0 {
             self.reader.seek_relative(file.header.compressed_size as i64)?;
+            self.current_offset += file.header.compressed_size as u64;
         }
         Ok(())
+    }
+
+    pub fn seek_and_decompress(&mut self, zip_file: &ZipFile) -> Result<Vec<u8>, Error> {
+        self.reader.seek(SeekFrom::Start(zip_file.data_offset))?;
+        self.decompress(zip_file)
     }
 
     pub fn decompress(&mut self, zip_file: &ZipFile) -> Result<Vec<u8>, Error> {
@@ -147,6 +170,21 @@ impl ZipArchive {
                 } else {
                     self.skip_data(&zip_file)?;
                 }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn process_files_for_later(&mut self, file_processor: &mut dyn FileProcessor) -> Result<(), Error> {
+        loop {
+            let maybe_zip_file = self.next_zip_file()?;
+            if maybe_zip_file.is_none() {
+                break;
+            }
+            let zip_file = maybe_zip_file.unwrap();
+            if zip_file.header.uncompressed_size > 0 {
+                self.skip_data(&zip_file)?;
+                file_processor.add_file(zip_file)?;
             }
         }
         Ok(())
